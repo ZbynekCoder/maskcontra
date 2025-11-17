@@ -8,7 +8,7 @@ from data.loader import load as load_dataset
 from rst_parser import RSTParser
 from masker.rs3 import read_text, write_text, find_segments, crop_window_with_closure
 from masker.context import extract_segments_dict, to_masked_nl
-from llm import LLM
+from llm import Filler, NLI
 
 
 def ensure_dir(path: str) -> None:
@@ -23,7 +23,7 @@ def sanitize_id(raw: str) -> str:
     return s or "sample"
 
 
-def evaluate_one_rs3(llm: LLM, rs3_text: str) -> Dict[str, Any]:
+def evaluate_one_rs3(filler: Filler, nli: NLI, rs3_text: str) -> Dict[str, Any]:
     segs = find_segments(rs3_text)
     thr = config.NLI_CONFIDENCE_THRESHOLD
 
@@ -48,10 +48,33 @@ def evaluate_one_rs3(llm: LLM, rs3_text: str) -> Dict[str, Any]:
     def worker(payload):
         sid, orig, masked_rs3 = payload
         context_nl = to_masked_nl(extract_segments_dict(masked_rs3))
-        llm_text = llm.fill_mask(context_nl)
-        nli = llm.classify_nli(orig, llm_text)
-        label = nli["label"]
-        conf = nli["confidence"]
+        # 生成多候选
+        cands = filler.fill_mask_candidates(context_nl, ref_text=orig, mode=config.FILLER_MODE,
+                                            k=getattr(config, "FILLER_CANDIDATES", 4))
+
+        # NLI 评估并挑选最佳：优先 非矛盾(= entail/neutral) 且置信最高；若全是 contradiction，选置信度最低的矛盾（最不确定）
+        best = None
+        best_score = -1.0
+        fallback = None
+        fallback_score = 1e9
+        for s in cands:
+            v = nli.classify_nli(premise=orig, hypothesis=s)
+            label, conf = v["label"], float(v["confidence"])
+            if label != "contradiction":
+                score = conf  # 越大越好
+                if score > best_score:
+                    best, best_score = (s, v), score
+            else:
+                # 作为兜底：选置信度最低的 contradiction
+                if conf < fallback_score:
+                    fallback, fallback_score = (s, v), conf
+
+        if best is None:
+            llm_text, verdict = fallback
+        else:
+            llm_text, verdict = best
+
+        label, conf = verdict["label"], verdict["confidence"]
         contradictory = (label == "contradiction" and conf >= thr)
         return sid, {
             "segment_id": sid,
@@ -112,7 +135,8 @@ def run(
 
     # 2) Init services
     rst = RSTParser(hf_model_name=config.HF_MODEL_NAME, hf_version=hf_version, cuda_device=cuda_device)
-    llm = LLM()
+    filler = Filler()
+    nli = NLI()
 
     # 3) Parse -> RS3
     for it in items:
@@ -121,7 +145,6 @@ def run(
         rs3_path = os.path.join(out_rs3_dir, f"{iid}.rs3")
         rst.save_rs3(text, rs3_path)
 
-    print("11111111111111111111111111111111111111111111111111111")
 
     # 4) Evaluate
     results_path = os.path.join(out_eval_dir, "results.jsonl")
@@ -151,27 +174,7 @@ def run(
                 )
                 write_text(os.path.join(out_masked_dir, f"{iid}_seg{idx}.rs3"), masked_txt)
 
-
-        eval_res = evaluate_one_rs3(llm, rs3_text)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        eval_res = evaluate_one_rs3(filler, nli, rs3_text)
 
         per_id_json = {"id": raw_id, "label": label, "meta": meta, "eval": eval_res}
         per_id_path = os.path.join(out_eval_dir, f"{iid}.json")
